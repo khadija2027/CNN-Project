@@ -1,11 +1,11 @@
-import os
-import random
+import csv
 import json
 import time
 from io import BytesIO
 import base64
 import logging
 import msvcrt
+from pathlib import Path
 
 from PIL import Image
 import numpy as np
@@ -21,6 +21,11 @@ class SimpleClient(SDClient):
         self.last_image = None
         self.car_loaded = False
         self.image_index = 0
+        self.dataset_dir = Path(__file__).resolve().parent / "dataset"
+        self.last_dataset_capture = 0.0
+        self.last_cte = None
+        self.last_cte_rate = 0.0
+        self.last_cte_time = None
 
     def on_msg_recv(self, json_packet):
         if json_packet['msg_type'] == "need_car_config":
@@ -30,35 +35,221 @@ class SimpleClient(SDClient):
             self.car_loaded = True
 
         if json_packet['msg_type'] == "telemetry":
+            now = time.monotonic()
+            cte = json_packet.get("cte")
+            if cte is None:
+                self.last_cte = None
+                self.last_cte_rate = 0.0
+                self.last_cte_time = None
+            else:
+                try:
+                    cte = float(cte)
+                except (TypeError, ValueError):
+                    logging.warning("Ignoring invalid simulator cross-track error: %r", cte)
+                    self.last_cte = None
+                    self.last_cte_rate = 0.0
+                    self.last_cte_time = None
+                else:
+                    if np.isfinite(cte):
+                        if self.last_cte is not None and self.last_cte_time is not None:
+                            elapsed = now - self.last_cte_time
+                            if elapsed > 0:
+                                self.last_cte_rate = (cte - self.last_cte) / elapsed
+                        else:
+                            self.last_cte_rate = 0.0
+                        self.last_cte = cte
+                        self.last_cte_time = now
+                    else:
+                        logging.warning("Ignoring non-finite simulator cross-track error: %r", cte)
+                        self.last_cte = None
+                        self.last_cte_rate = 0.0
+                        self.last_cte_time = None
+
             imgString = json_packet["image"]
             image = Image.open(BytesIO(base64.b64decode(imgString)))
-            image.save(f"camera/{self.image_index:04d}_a.png")
             self.image_index += 1
             self.last_image = np.asarray(image)
-            print("img:", self.last_image.shape)
-
             #don't have to, but to clean up the print, delete the image string.
             del json_packet["image"]
 
             if "imageb" in json_packet:
                 imgString = json_packet["imageb"]
                 image = Image.open(BytesIO(base64.b64decode(imgString)))
-                image.save(f"camera_b.png")
                 np_img = np.asarray(image)
-                print("imgb:", np_img.shape)
-
                 #don't have to, but to clean up the print, delete the image string.
                 del json_packet["imageb"]
 
             if "lidar" in json_packet:
                 lidar = json_packet["lidar"]
-                if lidar is not None:
-                    print("lidar:", len(lidar), "pts")
-
                 #don't have to, but to clean up the print, delete the lidar string.
                 del json_packet["lidar"]
 
-        print("got:", json_packet)
+        if json_packet.get("msg_type") != "telemetry":
+            print("got:", json_packet)
+
+    @staticmethod
+    def _lane_center(image, row_fraction):
+        height, width = image.shape[:2]
+        y = min(height - 1, int(height * row_fraction))
+        row = image[y]
+
+        if image.ndim == 2:
+            brightness = row
+            color_spread = np.zeros_like(row)
+        else:
+            pixels = row[:, :3].astype(np.int16)
+            brightness = pixels.min(axis=1)
+            color_spread = pixels.max(axis=1) - brightness
+
+        marked = np.flatnonzero((brightness >= 145) & (color_spread <= 65))
+        if marked.size == 0:
+            return None
+
+        groups = np.split(marked, np.flatnonzero(np.diff(marked) > 1) + 1)
+        candidates = [
+            (int(group[0]) + int(group[-1])) / 2
+            for group in groups
+            if 2 <= len(group) <= 14
+        ]
+        if not candidates:
+            return None
+
+        target_width = width * min(0.92, 0.54 + max(0.0, row_fraction - 0.52) * 2.8)
+        pairs = [
+            (left, right)
+            for left in candidates
+            for right in candidates
+            if left < width * 0.48
+            and right > width * 0.52
+            and width * 0.30 <= right - left <= width * 0.98
+        ]
+        if pairs:
+            left, right = min(
+                pairs,
+                key=lambda pair: abs((pair[1] - pair[0]) - target_width)
+                + 0.2 * abs((pair[0] + pair[1]) / 2 - width / 2),
+            )
+            return (left + right) / 2
+
+        left_edges = [x for x in candidates if width * 0.08 <= x < width * 0.48]
+        right_edges = [x for x in candidates if width * 0.52 < x <= width * 0.92]
+        if bool(left_edges) == bool(right_edges):
+            return None
+
+        if left_edges:
+            return min(width, min(left_edges) + target_width / 2)
+        return max(0.0, max(right_edges) - target_width / 2)
+
+    @classmethod
+    def _autopilot_controls(cls, image):
+        if image is None or image.ndim not in (2, 3):
+            return None
+
+        height, width = image.shape[:2]
+        yellow_centers = {}
+        if image.ndim == 3 and image.shape[2] >= 3:
+            pixels = image[:, :, :3].astype(np.int16)
+            red, green, blue = pixels[:, :, 0], pixels[:, :, 1], pixels[:, :, 2]
+            yellow = (
+                (red >= 100)
+                & (green >= 85)
+                & (blue <= 120)
+                & (red - blue >= 45)
+                & (green - blue >= 35)
+                & (np.abs(red - green) <= 75)
+            )
+
+            previous_center = width / 2
+            for fraction in (0.42, 0.47, 0.52, 0.57, 0.62, 0.67, 0.72, 0.77):
+                y = int(height * fraction)
+                band = yellow[max(0, y - 1):min(height, y + 2), :]
+                columns = np.flatnonzero(np.any(band, axis=0))
+                if columns.size == 0:
+                    continue
+
+                groups = np.split(columns, np.flatnonzero(np.diff(columns) > 1) + 1)
+                candidates = [
+                    (int(group[0]) + int(group[-1])) / 2
+                    for group in groups
+                    if 2 <= len(group) <= max(3, int(width * 0.20))
+                ]
+                if not candidates:
+                    continue
+
+                center = min(
+                    candidates,
+                    key=lambda candidate: abs(candidate - previous_center)
+                    + 0.12 * abs(candidate - width / 2),
+                )
+                yellow_centers[fraction] = center
+                previous_center = center
+
+        if yellow_centers:
+            far_centers = [
+                center for fraction, center in yellow_centers.items() if fraction <= 0.57
+            ]
+            near_centers = [
+                center for fraction, center in yellow_centers.items() if fraction >= 0.62
+            ]
+            detected_centers = list(yellow_centers.values())
+            lane_confidence = min(1.0, len(yellow_centers) / 4.0)
+        else:
+            row_centers = {
+                fraction: cls._lane_center(image, fraction)
+                for fraction in (0.52, 0.54, 0.56, 0.58)
+            }
+            far_centers = [
+                row_centers[y] for y in (0.52, 0.54)
+                if row_centers[y] is not None
+            ]
+            near_centers = [
+                row_centers[y] for y in (0.56, 0.58)
+                if row_centers[y] is not None
+            ]
+            detected_centers = far_centers + near_centers
+            lane_confidence = min(1.0, len(detected_centers) / 3.0)
+
+        if not detected_centers:
+            return None
+
+        far_center = float(np.mean(far_centers or detected_centers))
+        near_center = float(np.mean(near_centers or detected_centers))
+        lateral_error = (near_center - width / 2) / (width / 2)
+        curve_error = (near_center - far_center) / (width / 2)
+        steering = float(np.clip(0.85 * lateral_error + 0.65 * curve_error, -0.55, 0.55))
+        corner_severity = min(1.0, max(abs(steering), 1.8 * abs(curve_error)))
+        speed_limit = 0.30 - 0.18 * corner_severity
+        throttle = speed_limit * (0.4 + 0.6 * lane_confidence)
+        return steering, throttle, corner_severity
+
+    @staticmethod
+    def _telemetry_controls(cte, cte_rate):
+        cte_rate = float(np.clip(cte_rate, -3.0, 3.0))
+        steering = float(np.clip(-0.35 * cte - 0.06 * cte_rate, -0.55, 0.55))
+        corner_severity = min(
+            1.0,
+            max(abs(cte), 0.15 * abs(cte_rate)),
+        )
+        throttle = 0.20 - 0.12 * corner_severity
+        return steering, throttle, corner_severity
+
+    def _record_training_sample(self, steering, throttle, brake):
+        now = time.monotonic()
+        if self.last_image is None or now - self.last_dataset_capture < 0.2:
+            return
+
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        image_name = f"frame_{self.image_index:06d}_{time.time_ns()}.png"
+        Image.fromarray(self.last_image).save(self.dataset_dir / image_name)
+
+        labels_path = self.dataset_dir / "labels.csv"
+        write_header = not labels_path.exists() or labels_path.stat().st_size == 0
+        with labels_path.open("a", newline="", encoding="utf-8") as labels_file:
+            writer = csv.writer(labels_file)
+            if write_header:
+                writer.writerow(("image", "steering", "throttle", "brake"))
+            writer.writerow((image_name, steering, throttle, brake))
+        self.last_dataset_capture = now
 
     def send_config(self):
         '''
@@ -148,35 +339,101 @@ class SimpleClient(SDClient):
         time.sleep(self.poll_socket_sleep_sec)
 
     def drive_with_keyboard(self, duration=50.0):
-        """Drive in the PowerShell window: A/D steer, W/S adjust throttle, Q quits."""
+        """Drive manually or use image-based autopilot; manual frames are labeled for training."""
         steering = 0.0
         throttle = 0.0
-        steering_step = 0.08
-        throttle_step = 0.05
+        steering_step = 0.15
+        steering_return_step = 0.02
+        throttle_step = 0.10
+        autopilot = True
+        lane_lost = False
+        autopilot_started = time.monotonic()
         start = time.time()
 
-        print("Keyboard driving: A/D steer, W/S throttle, X brake, Space coast, Q quit")
+        print("Autopilot enabled. Press P for manual control; Q quits.")
+        print("Manual driving: A/D steer, W/S throttle, X brake, Space coast.")
+        print("Manual image/control samples are saved to dataset/ for training.")
         while time.time() - start < duration:
             brake = 0.0
+            emergency_brake = False
             while msvcrt.kbhit():
                 key = msvcrt.getwch().lower()
                 if key == "q":
                     self.send_controls(0.0, 0.0)
                     return
-                elif key == "a":
-                    steering = max(-1.0, steering - steering_step)
-                elif key == "d":
-                    steering = min(1.0, steering + steering_step)
-                elif key == "w":
-                    throttle = min(1.0, throttle + throttle_step)
-                elif key == "s":
-                    throttle = max(-1.0, throttle - throttle_step)
-                elif key == " ":
+                elif key == "p":
+                    autopilot = not autopilot
+                    steering = 0.0
                     throttle = 0.0
+                    lane_lost = False
+                    autopilot_started = time.monotonic()
+                    print("Autopilot enabled." if autopilot else "Manual control enabled.")
                 elif key == "x":
-                    brake = 1.0
+                    emergency_brake = True
+                elif not autopilot and key == "a":
+                    steering = max(-1.0, steering - steering_step)
+                elif not autopilot and key == "d":
+                    steering = min(1.0, steering + steering_step)
+                elif not autopilot and key == "w":
+                    throttle = min(1.0, throttle + throttle_step)
+                elif not autopilot and key == "s":
+                    throttle = max(-1.0, throttle - throttle_step)
+                elif not autopilot and key == " ":
+                    throttle = 0.0
+
+            if emergency_brake:
+                brake = 1.0
+                throttle = 0.0
+            elif autopilot:
+                if self.last_cte is not None:
+                    target_steering, throttle, corner_severity = self._telemetry_controls(
+                        self.last_cte,
+                        self.last_cte_rate,
+                    )
+                    lane_lost = False
+                else:
+                    controls = self._autopilot_controls(self.last_image)
+                    if controls is None:
+                        target_steering = 0.0
+                        throttle = 0.0
+                        corner_severity = 0.0
+                        brake = 0.5
+                        if not lane_lost:
+                            print("Track lines not detected; braking until they are visible.")
+                        lane_lost = True
+                    else:
+                        target_steering, throttle, corner_severity = controls
+                        lane_lost = False
+
+                launch_progress = min(
+                    1.0,
+                    (time.monotonic() - autopilot_started) / 4.0,
+                )
+                throttle *= 0.2 + 0.8 * launch_progress
+                steering_limit = 0.25 + 0.30 * min(1.0, launch_progress * 2.0)
+                target_steering = float(np.clip(
+                    target_steering,
+                    -steering_limit,
+                    steering_limit,
+                ))
+                if abs(target_steering) < 0.05:
+                    target_steering = 0.0
+                max_steering_change = 0.04
+                steering_change = float(np.clip(
+                    target_steering - steering,
+                    -max_steering_change,
+                    max_steering_change,
+                ))
+                steering += steering_change
 
             self.send_controls(steering, throttle, brake)
+            if not autopilot:
+                self._record_training_sample(steering, throttle, brake)
+                # Let go of A/D and steering gradually returns to center.
+                if steering > 0.0:
+                    steering = max(0.0, steering - steering_return_step)
+                elif steering < 0.0:
+                    steering = min(0.0, steering + steering_return_step)
             time.sleep(0.05)
 
 

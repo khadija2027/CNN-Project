@@ -26,10 +26,23 @@ class SimpleClient(SDClient):
         self.last_cte = None
         self.last_cte_rate = 0.0
         self.last_cte_time = None
+        self.last_image_time = None
+        self.car_configured = False
+
+    @staticmethod
+    def _frame_message(message):
+        return message if message.endswith("\n") else f"{message}\n"
+
+    def send(self, message):
+        super().send(self._frame_message(message))
+
+    def send_now(self, message):
+        super().send_now(self._frame_message(message))
 
     def on_msg_recv(self, json_packet):
         if json_packet['msg_type'] == "need_car_config":
-            self.send_config()
+            if not self.car_configured:
+                self.send_config()
 
         if json_packet['msg_type'] == "car_loaded":
             self.car_loaded = True
@@ -69,6 +82,7 @@ class SimpleClient(SDClient):
             image = Image.open(BytesIO(base64.b64decode(imgString)))
             self.image_index += 1
             self.last_image = np.asarray(image)
+            self.last_image_time = now
             #don't have to, but to clean up the print, delete the image string.
             del json_packet["image"]
 
@@ -216,21 +230,28 @@ class SimpleClient(SDClient):
         near_center = float(np.mean(near_centers or detected_centers))
         lateral_error = (near_center - width / 2) / (width / 2)
         curve_error = (near_center - far_center) / (width / 2)
-        steering = float(np.clip(0.85 * lateral_error + 0.65 * curve_error, -0.55, 0.55))
-        corner_severity = min(1.0, max(abs(steering), 1.8 * abs(curve_error)))
-        speed_limit = 0.30 - 0.18 * corner_severity
-        throttle = speed_limit * (0.4 + 0.6 * lane_confidence)
+        steering = float(np.clip(
+            0.85 * lateral_error + 1.2 * curve_error,
+            -0.75,
+            0.75,
+        ))
+        corner_severity = min(
+            1.0,
+            max(abs(steering) / 0.75, 2.4 * abs(curve_error)),
+        )
+        speed_limit = 0.45 - 0.25 * corner_severity
+        throttle = speed_limit * (0.6 + 0.4 * lane_confidence)
         return steering, throttle, corner_severity
 
     @staticmethod
     def _telemetry_controls(cte, cte_rate):
         cte_rate = float(np.clip(cte_rate, -3.0, 3.0))
-        steering = float(np.clip(-0.35 * cte - 0.06 * cte_rate, -0.55, 0.55))
+        steering = float(np.clip(-0.35 * cte - 0.06 * cte_rate, -0.75, 0.75))
         corner_severity = min(
             1.0,
             max(abs(cte), 0.15 * abs(cte_rate)),
         )
-        throttle = 0.20 - 0.12 * corner_severity
+        throttle = 0.45 - 0.25 * corner_severity
         return steering, throttle, corner_severity
 
     def _record_training_sample(self, steering, throttle, brake):
@@ -255,6 +276,10 @@ class SimpleClient(SDClient):
         '''
         send three config messages to setup car, racer, and camera
         '''
+        if self.car_configured:
+            return
+        self.car_configured = True
+
         racer_name = "Reda"
         car_name = "Choupette 53"
         bio = ""
@@ -349,6 +374,7 @@ class SimpleClient(SDClient):
         lane_lost = False
         autopilot_started = time.monotonic()
         start = time.time()
+        sensor_timeout = 0.5
 
         print("Autopilot enabled. Press P for manual control; Q quits.")
         print("Manual driving: A/D steer, W/S throttle, X brake, Space coast.")
@@ -385,32 +411,65 @@ class SimpleClient(SDClient):
                 brake = 1.0
                 throttle = 0.0
             elif autopilot:
-                if self.last_cte is not None:
+                now = time.monotonic()
+                cte_fresh = (
+                    self.last_cte is not None
+                    and self.last_cte_time is not None
+                    and now - self.last_cte_time <= sensor_timeout
+                )
+                image_fresh = (
+                    self.last_image is not None
+                    and self.last_image_time is not None
+                    and now - self.last_image_time <= sensor_timeout
+                )
+                visual_controls = (
+                    self._autopilot_controls(self.last_image)
+                    if image_fresh else None
+                )
+
+                if cte_fresh:
                     target_steering, throttle, corner_severity = self._telemetry_controls(
                         self.last_cte,
                         self.last_cte_rate,
                     )
+                    if visual_controls is not None:
+                        visual_steering, visual_throttle, visual_corner_severity = visual_controls
+                        target_steering = (
+                            0.7 * target_steering + 0.3 * visual_steering
+                        )
+                        throttle = min(throttle, visual_throttle)
+                        corner_severity = max(corner_severity, visual_corner_severity)
                     lane_lost = False
                 else:
-                    controls = self._autopilot_controls(self.last_image)
-                    if controls is None:
+                    if visual_controls is None:
                         target_steering = 0.0
                         throttle = 0.0
                         corner_severity = 0.0
-                        brake = 0.5
+                        brake = 1.0
                         if not lane_lost:
-                            print("Track lines not detected; braking until they are visible.")
+                            print("No fresh steering data; braking until sensor data returns.")
                         lane_lost = True
                     else:
-                        target_steering, throttle, corner_severity = controls
+                        target_steering, throttle, corner_severity = visual_controls
                         lane_lost = False
+
+                if not lane_lost:
+                    brake = max(
+                        brake,
+                        0.45 * float(np.clip(
+                            (corner_severity - 0.55) / 0.45,
+                            0.0,
+                            1.0,
+                        )),
+                    )
+                    throttle *= 1.0 - brake
 
                 launch_progress = min(
                     1.0,
                     (time.monotonic() - autopilot_started) / 4.0,
                 )
                 throttle *= 0.2 + 0.8 * launch_progress
-                steering_limit = 0.25 + 0.30 * min(1.0, launch_progress * 2.0)
+                steering_limit = 0.30 + 0.45 * min(1.0, launch_progress * 2.0)
                 target_steering = float(np.clip(
                     target_steering,
                     -steering_limit,
@@ -418,11 +477,10 @@ class SimpleClient(SDClient):
                 ))
                 if abs(target_steering) < 0.05:
                     target_steering = 0.0
-                max_steering_change = 0.04
                 steering_change = float(np.clip(
                     target_steering - steering,
-                    -max_steering_change,
-                    max_steering_change,
+                    -(0.04 + 0.05 * corner_severity),
+                    0.04 + 0.05 * corner_severity,
                 ))
                 steering += steering_change
 
@@ -452,34 +510,36 @@ def test_clients():
     time_to_drive = 50.0
 
 
-    # Start Clients
-    for _ in range(0, num_clients):
-        c = SimpleClient(address=(host, port))
-        clients.append(c)
+    try:
+        for _ in range(num_clients):
+            clients.append(SimpleClient(address=(host, port)))
 
-    time.sleep(1)
+        time.sleep(1)
 
-    # Load Scene message. Only one client needs to send the load scene.
-    msg = '{ "msg_type" : "load_scene", "scene_name" : "roboracingleague_1" }'
-    clients[0].send_now(msg)
-    time.sleep(0.2)
-    clients[0].send_config()
+        # Only one client needs to request the scene.
+        msg = '{ "msg_type" : "load_scene", "scene_name" : "roboracingleague_1" }'
+        clients[0].send_now(msg)
 
-    # Drive manually from this PowerShell window
-    clients[0].drive_with_keyboard(duration=time_to_drive)
+        # The simulator requests car configuration asynchronously. Wait until
+        # its response confirms the car has spawned before sending controls.
+        print("Waiting for the simulator to load the car...")
+        load_deadline = time.monotonic() + 30.0
+        while not clients[0].car_loaded and time.monotonic() < load_deadline:
+            time.sleep(0.1)
+        if not clients[0].car_loaded:
+            raise TimeoutError(
+                "The simulator did not report car_loaded within 30 seconds. "
+                "Check that the simulator is open and has finished loading."
+            )
 
-    time.sleep(3.0)
-
-    # Exit Scene - optionally..
-    # msg = '{ "msg_type" : "exit_scene" }'
-    # clients[0].send_now(msg)
-
-    # Close down clients
-    print("waiting for msg loop to stop")
-    for c in clients:
-        c.stop()
-
-    print("clients to stopped")
+        print("Car loaded. Starting autopilot.")
+        clients[0].drive_with_keyboard(duration=time_to_drive)
+        time.sleep(1.0)
+    finally:
+        print("Waiting for message loops to stop.")
+        for client in clients:
+            client.stop()
+        print("Clients stopped.")
 
 
 

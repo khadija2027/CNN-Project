@@ -1,3 +1,12 @@
-/dataset
-/venv
-/_pycache__
+# Recorded driving data (large, regenerate with Data_builder.py)
+/dataset/
+
+# Python virtual environment
+/venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/

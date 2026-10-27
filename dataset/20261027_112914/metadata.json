@@ -1,0 +1,28 @@
+{
+  "session": "20261027_112914",
+  "created": "2026-10-27 11:29:14",
+  "columns": {
+    "image": "path of the frame, relative to this session folder",
+    "steering": "steering command sent with this frame, -1 (full left) .. +1 (full right)",
+    "throttle": "throttle command, 0 .. 1",
+    "brake": "brake command, 0 .. 1",
+    "speed": "measured speed, track units/s",
+    "target_speed": "speed the autopilot was aiming for, track units/s",
+    "off_center": "distance to the track centerline, track units",
+    "lap": "completed laps when the frame was taken",
+    "speed_scale": "autopilot corner-speed factor at that moment",
+    "timestamp": "seconds since the autopilot started"
+  },
+  "scene": "circuit_launch",
+  "image_size": [
+    255,
+    255,
+    3
+  ],
+  "image_encoding": "PNG",
+  "camera_fov": 150,
+  "control_hz": 50,
+  "position_scale": 8.0,
+  "final_speed_scale": 0.6776684999510426,
+  "frames": 1004
+}
